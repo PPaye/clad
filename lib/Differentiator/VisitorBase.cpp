@@ -666,8 +666,7 @@ namespace clad {
                      .get();
       isArrow = false;
     }
-    NestedNameSpecifierLoc NNS(FD->getQualifier(),
-                               /*Data=*/nullptr);
+    NestedNameSpecifierLoc NNS /* = FD->getQualifierLoc()*/;
     auto DAP = DeclAccessPair::make(FD, FD->getAccess());
     auto* memberExpr = MemberExpr::Create(
         m_Context, thisExpr, isArrow, Loc, NNS, noLoc, FD, DAP,

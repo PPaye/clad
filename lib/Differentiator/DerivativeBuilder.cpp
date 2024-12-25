@@ -50,48 +50,30 @@ DerivativeBuilder::DerivativeBuilder(clang::Sema& S, plugin::CladPlugin& P,
 
 DerivativeBuilder::~DerivativeBuilder() {}
 
-static void registerDerivative(FunctionDecl* derivedFD, Sema& semaRef) {
-  LookupResult R(semaRef, derivedFD->getNameInfo(), Sema::LookupOrdinaryName);
-  // FIXME: Attach out-of-line virtual function definitions to the TUScope.
-  Scope* S = semaRef.getScopeForContext(derivedFD->getDeclContext());
-  semaRef.CheckFunctionDeclaration(
-      S, derivedFD, R,
-      /*IsMemberSpecialization=*/
-      false
-      /*DeclIsDefn*/ CLAD_COMPAT_CheckFunctionDeclaration_DeclIsDefn_ExtraParam(
-          derivedFD));
-
-  // FIXME: Avoid the DeclContext lookup and the manual setPreviousDecl.
-  // Consider out-of-line virtual functions.
-  {
-    DeclContext* LookupCtx = derivedFD->getDeclContext();
-    // Find the first non-transparent context to perform the lookup in.
-    while (LookupCtx->isTransparentContext())
-      LookupCtx = LookupCtx->getParent();
-    auto R = LookupCtx->noload_lookup(derivedFD->getDeclName());
-
-    for (NamedDecl* I : R) {
-      if (auto* FD = dyn_cast<FunctionDecl>(I)) {
-        // FIXME: We still do extra work in creating a derivative and throwing
-        // it away.
-        if (FD->getDefinition())
-          return;
-
-        if (derivedFD->getASTContext().hasSameFunctionTypeIgnoringExceptionSpec(
-                derivedFD->getType(), FD->getType())) {
-          // Register the function on the redecl chain.
-          derivedFD->setPreviousDecl(FD);
-          break;
-        }
-      }
-    }
-    // Inform the decl's decl context for its existance after the lookup,
-    // otherwise it would end up in the LookupResult.
-    derivedFD->getDeclContext()->addDecl(derivedFD);
-
-    // FIXME: Rebuild VTable to remove requirements for "forward" declared
-    // virtual methods
+static void registerDerivative(FunctionDecl* derivedFD, Sema& semaRef,
+                               const DiffRequest& R) {
+  DeclContext* DC = derivedFD->getLexicalDeclContext();
+  auto* RD = dyn_cast<RecordDecl>(DC);
+  if (!RD /* || !RD->isLambda()*/) {
+    LookupResult R(semaRef, derivedFD->getNameInfo(), Sema::LookupOrdinaryName);
+    // FIXME: Attach out-of-line virtual function definitions to the TUScope.
+    semaRef.LookupQualifiedName(R, DC);
+    semaRef.CheckFunctionDeclaration(
+        /*Scope=*/nullptr, derivedFD, R,
+        /*IsMemberSpecialization=*/
+        false
+        /*DeclIsDefn*/
+        CLAD_COMPAT_CheckFunctionDeclaration_DeclIsDefn_ExtraParam(derivedFD));
+    if (derivedFD->isInvalidDecl())
+      return; // CheckFunctionDeclaration was unhappy about derivedFD
+  } else {
+    // Size >= current derivative order means that there exists a declaration
+    // or prototype for the currently derived function.
+    if (R.DerivedFDPrototypes.size() >= R.CurrentDerivativeOrder)
+      derivedFD->setPreviousDeclaration(
+          R.DerivedFDPrototypes[R.CurrentDerivativeOrder - 1]);
   }
+  DC->addDecl(derivedFD);
 }
 
   static bool hasAttribute(const Decl *D, attr::Kind Kind) {
@@ -107,10 +89,11 @@ static void registerDerivative(FunctionDecl* derivedFD, Sema& semaRef) {
       clang::DeclarationNameInfo name, clang::QualType functionType) {
     FunctionDecl* returnedFD = nullptr;
     NamespaceDecl* enclosingNS = nullptr;
+    TypeSourceInfo* TSI = m_Context.getTrivialTypeSourceInfo(functionType);
     if (isa<CXXMethodDecl>(FD)) {
       CXXRecordDecl* CXXRD = cast<CXXRecordDecl>(DC);
       returnedFD = CXXMethodDecl::Create(
-          m_Context, CXXRD, noLoc, name, functionType, FD->getTypeSourceInfo(),
+          m_Context, CXXRD, noLoc, name, functionType, TSI,
           FD->getCanonicalDecl()->getStorageClass()
               CLAD_COMPAT_FunctionDecl_UsesFPIntrin_Param(FD),
           FD->isInlineSpecified(), clad_compat::Function_GetConstexprKind(FD),
@@ -120,8 +103,7 @@ static void registerDerivative(FunctionDecl* derivedFD, Sema& semaRef) {
       assert (isa<FunctionDecl>(FD) && "Unexpected!");
       enclosingNS = VB.RebuildEnclosingNamespaces(DC);
       returnedFD = FunctionDecl::Create(
-          m_Context, m_Sema.CurContext, noLoc, name, functionType,
-          FD->getTypeSourceInfo(),
+          m_Context, m_Sema.CurContext, noLoc, name, functionType, TSI,
           FD->getCanonicalDecl()->getStorageClass()
               CLAD_COMPAT_FunctionDecl_UsesFPIntrin_Param(FD),
           FD->isInlineSpecified(), FD->hasWrittenPrototype(),
@@ -337,6 +319,18 @@ static void registerDerivative(FunctionDecl* derivedFD, Sema& semaRef) {
           (derivative->isDefined() || m_DFC.IsCustomDerivative(derivative)))
         alreadyDerived = true;
 
+      // Remove default args to avoid conflicts with the default arguments in
+      // the definition. Default arguments cause issues in tests with
+      // hessians. This code will go away when we land the work on static
+      // diff graphs.
+      if (derivative) {
+        for (ParmVarDecl* P : derivative->parameters()) {
+          if (!P->hasDefaultArg())
+            continue;
+          P->setDefaultArg(nullptr);
+        }
+      }
+
       // Add the request to derive the definition of the forward mode derivative
       // to the schedule.
       request.DeclarationOnly = false;
@@ -475,9 +469,9 @@ static void registerDerivative(FunctionDecl* derivedFD, Sema& semaRef) {
     //   derivative is a member function it goes into an infinite loop
     if (!m_DFC.IsCustomDerivative(result.derivative)) {
       if (auto* FD = result.derivative)
-        registerDerivative(FD, m_Sema);
+        registerDerivative(FD, m_Sema, request);
       if (auto* OFD = result.overload)
-        registerDerivative(OFD, m_Sema);
+        registerDerivative(OFD, m_Sema, request);
     }
 
     return result;
